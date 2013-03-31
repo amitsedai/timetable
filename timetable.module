@@ -1,0 +1,816 @@
+<?php
+/**
+* Display help and module information
+* @param path which path of the site we're displaying help
+* @param arg array that holds the current path as would be returned from arg() function
+* @return help text for the path
+*/
+function timetable_help($path, $arg) {
+  $output = '';  //declare your output variable
+  switch ($path) {
+    case "admin/help#timetable":
+      $output = '<p>'.  t("Provides custom TimeTable for Educational Institutions") .'</p>';
+      break;
+  }
+  return $output;
+}
+
+function timetable_getsectiondata($school_nid=NULL){
+  $view = views_get_view('school_classes');
+  $display='default';
+  //$view->init();
+  if(is_numeric($school_nid)){
+    $view->set_arguments(array($school_nid));
+  }
+  $view->set_display($display);
+  $view->execute();
+  return $view->result;
+}
+
+function timetable_get_unavailabilityview($school_nid){
+  $view = views_get_view('teacher_unavailability_slots');
+  $display='default';
+  if(is_numeric($school_nid)){
+    $view->set_arguments(array($school_nid));
+  }
+  $view->set_display($display);
+  $view->execute();
+  return $view->result;
+}
+
+function timetable_set_unavailability(&$school){
+  $unavailability = timetable_get_unavailabilityview($school->get_Id());
+  $teacher_unavailabilty = array();
+  $unavailabilty_arr = array();
+  foreach ($unavailability as $result) {
+    //drupal_set_message("<pre>".print_r($result,1)."</pre>");
+    $teacher = $school->get_teacher($result->nid);
+    if(isset($result->field_field_tchr_unavailable_slots[0])){
+      foreach ($result->field_field_tchr_unavailable_slots as $key => $unavailable_slotsfc) {
+        $entity_data =entity_load_single('field_collection_item',$unavailable_slotsfc['raw']['value']);
+        //drupal_set_message("<pre>".print_r($entity_data,1)."</pre>");
+        $week = $entity_data->field_unavailable_week[LANGUAGE_NONE][0]['value'];
+        if($teacher instanceof Teacher){
+          $periods =  array();
+          if(isset($entity_data->field_unavailable_period[LANGUAGE_NONE][0])) {
+            foreach ($entity_data->field_unavailable_period[LANGUAGE_NONE] as $key => $period) {
+              $periods[] = $period['value'];
+            }
+          }
+          $maxslots = $week == Constants::DAY_SATURDAY?$school->get_preferences()->get_sat_totclass():$school->get_slotmax();
+          $dummy_subject = $school->get_preferences()->get_dummy_subject($teacher, TRUE);
+          $teacher->set_unavailability(new Unavailability($week,$periods),$maxslots,$dummy_subject);
+        }
+      }
+    }
+  }
+}
+
+function timetable_getnid($school_nid){
+  $node_nid=NULL;
+  $view = views_get_view('school_timetable');
+  $display='default';
+  if(is_numeric($school_nid)){
+  $view->set_arguments(array($school_nid));
+  }
+  $view->set_display($display);
+  $view->execute();
+  foreach ($view->result as $result){
+  $node_nid = $result->nid;
+  break;
+  }
+  return $node_nid;
+}
+
+function timetable_getschools(){
+  $schools=array();
+  $view = views_get_view('school_view');
+  //$view->init();
+  $display='default';
+  $view->set_display($display);
+  $view->execute();
+  foreach ($view->result as $key => $result) {
+    $schools[$result->nid] = $result->node_title;
+  }
+  return $schools;
+}
+
+function timetable_validate_sectionclass($school){
+  $flag = FALSE;
+  $school_tot_count = $school->total_class_count();
+  $section_count_arr = $school->get_section_class_count();
+  if(!empty($section_count_arr)){
+    foreach ($section_count_arr as $section_name => $total_count) {
+      if($school_tot_count!= $total_count){
+        $difference = abs($school_tot_count - $total_count);
+        if($total_count > $school_tot_count){
+          drupal_set_message("Classes for $section_name exceeds total class per section by $difference class(es). Please resolve excess classes to continue!");
+          $flag = TRUE;
+        }else{
+          drupal_set_message("Classes for $section_name is short total class per section by $difference class(es)");
+        }
+      }
+    }
+  }
+  return $flag;
+}
+
+
+function timetable_initializedata(&$school){
+  $data_result = timetable_getsectiondata($school->get_Id());
+  //drupal_set_message("Data result is: <pre>".print_r($data_result,1)."</pre>");
+  foreach ($data_result as $key => $result){
+    $section =new Section($result->node_title,$result->nid);
+    if(isset($result->field_field_class_teacher[0])){
+      $teacher_title =$result->field_field_class_teacher[0]['raw']['entity']->title;
+      $teacher_nid= $result->field_field_class_teacher[0]['raw']['entity']->nid;
+      $section_teacher = new Teacher($teacher_nid,$teacher_title);
+      $section->set_class_teacher($section_teacher);
+      $school->set_teachers($section_teacher);
+    }
+    $section->get_timetableobj()->set_timetableslots($school->get_slotmax(),$school->get_preferences()->get_sat_totclass());
+    $subjects = array();
+    $section_class_count = 0;
+    foreach ($result->field_field_class_subjects as $key => $class_subject) {
+      if(isset($class_subject['raw'])){
+        $subjectfc = $class_subject['raw']['value'];
+        $data =entity_load_single('field_collection_item',$subjectfc);
+        $subject_count =$data->field_class_num_count[LANGUAGE_NONE][0]['value'];
+        $subject_type = Constants::TYPE_MAINSUBJECT;
+        $subject_name ="";
+        if(!empty($data->field_class_subteacher)
+          && isset($data->field_class_subject_name[LANGUAGE_NONE])
+          && is_numeric($data->field_class_subteacher[LANGUAGE_NONE][0]['target_id'])){
+          $subject_name = $data->field_class_subject_name[LANGUAGE_NONE][0]['value'];
+          $subj_teacherid = $data->field_class_subteacher[LANGUAGE_NONE][0]['target_id'];
+          $teacherObj = $school->get_teacher($subj_teacherid);
+          if(empty($teacherObj)){
+            $teacher_node =node_load($subj_teacherid);
+            $subject_teacher = $teacher_node->title;
+            $teacherObj = new Teacher($subj_teacherid,$subject_teacher);
+            $school->set_teachers($teacherObj);
+          }
+          $subject = new Subject($subjectfc,$subject_name,$subject_type,$teacherObj,$subject_count);
+
+          if(!empty($data->field_class_resource_reqd[LANGUAGE_NONE])
+            && !empty($data->field_class_resource[LANGUAGE_NONE])){
+            $is_resource_reqd = $data->field_class_resource_reqd[LANGUAGE_NONE][0]['value'];
+            //drupal_set_message("Is resource reqd: $is_resource_reqd");
+            if($is_resource_reqd == 1){
+              $class_resource = $data->field_class_resource[LANGUAGE_NONE][0]['target_id'];
+              $subject_type = Constants::TYPE_LABSUBJECT;
+              $subject->set_sub_type($subject_type);
+              $subject->set_room_booking_reqd($is_resource_reqd);
+              $subject->set_allocated_room($class_resource);
+              if(!empty($data->field_class_subj_num_consec[LANGUAGE_NONE])){
+                $subject->set_num_consec_class($data->field_class_subj_num_consec[LANGUAGE_NONE][0]['value']);
+              }
+            }
+          }
+          if(!empty($data->field_subject_class_shared[LANGUAGE_NONE])
+            && !empty($data->field_class_shared_section[LANGUAGE_NONE])){
+            $is_subj_class_shared = $data->field_subject_class_shared[LANGUAGE_NONE][0]['value'];
+            $shared_section = array();
+            foreach ($data->field_class_shared_section[LANGUAGE_NONE] as $key => $shared_sectionval) {
+              array_push($shared_section, $shared_sectionval['target_id']);
+            }
+            //drupal_set_message("<pre>".print_r($shared_section,1)."</pre>");
+            //$shared_section = $data->field_class_shared_section[LANGUAGE_NONE][0]['target_id'];
+            $subject->set_is_subj_shared($is_subj_class_shared);
+            $subject->set_shared_sections($shared_section);
+          }
+          $section->set_subjects($subject);
+        }
+      }
+    }
+    $school->set_section_class_count($section->getName(),$section_class_count);
+    $school->set_sections($section);
+  }
+  return $school;
+}
+
+function timetable_get_teachers($school){
+  $teacher_count = array();
+  foreach ($school->get_sections() as $key => $section) {
+    $subjects =  $section->get_allsubjects();
+    foreach ($subjects as $key => $subject) {
+      $teacher = $subject->get_subject_teacher();
+      if(!isset($teacher_count[$teacher->get_teacher_id()])){
+        $teacher_count[$teacher->get_teacher_id()] = 1;
+      }else if($subject->get_sub_type()== Constants::TYPE_MAINSUBJECT){
+         $teacher_count[$teacher->get_teacher_id()]=$teacher_count[$teacher->get_teacher_id()]+2;
+      }else{
+        $teacher_count[$teacher->get_teacher_id()]=$teacher_count[$teacher->get_teacher_id()]+1;
+      }
+    }
+  }
+  //Sort teachers on ascending value of count
+  arsort($teacher_count);
+  //drupal_set_message(" Teacher Count: <pre>".print_r($teacher_count,1)."</pre>");
+  return $teacher_count;
+
+}
+
+function timetable_allocate(&$school){
+  $teacher_count = timetable_get_teachers($school);
+  $subjects_precedence = array();
+  foreach ($school->get_sections() as $key => $section) {
+    $subject_count = array();
+    $allsubjects = $section->get_allsubjects();
+
+    foreach ($allsubjects as $key => $subject) {
+      $teacher = $subject->get_subject_teacher();
+      if(isset($teacher_count[$teacher->get_teacher_id()])){
+        $subject_count[$subject->get_subject_id()] = $teacher_count[$teacher->get_teacher_id()];
+      }else{
+        $subject_count[$subject->get_subject_id()] = 0;
+      }
+    }
+    arsort($subject_count);
+    $subjects = array();
+    foreach ($subject_count as $subject_id => $count) {
+      $subjects[] = $section->get_subject($subject_id);
+    }
+    $section->get_timetableobj()->update_slot($school,$section,$subjects);
+  }
+}
+
+
+function timetable_getpreallocated_data($school_nid){
+  $view = views_get_view('pre_allocated_classes');
+  $display='default';
+  if(is_numeric($school_nid)){
+    $view->set_arguments(array($school_nid));
+  }
+  $view->set_display($display);
+  $view->execute();
+  return $view->result;
+}
+
+
+
+function timetable_preallocate_classes(&$school){
+  $result = timetable_getpreallocated_data($school->get_Id());
+ // drupal_set_message("<pre>".print_r($result,1)."</pre>");
+  foreach ($result as $key => $data) {
+    $preallocated_node = node_load($data->nid);
+    //drupal_set_message("<pre>".print_r($preallocated_node,1)."</pre>");
+    foreach ($preallocated_node->field_pre_alloc_class[LANGUAGE_NONE] as $key => $alloc_collection) {
+      if(is_numeric($alloc_collection['value'])){
+        $alloc_entity = entity_load_single('field_collection_item',$alloc_collection['value']);
+        //drupal_set_message("<pre>".print_r($alloc_entity,1)."</pre>");
+        $week_arr=array($alloc_entity->field_pre_alloc_week[LANGUAGE_NONE][0]['value']);
+        $period_arr=array();
+        foreach ($alloc_entity->field_pre_alloc_period[LANGUAGE_NONE] as $key => $period) {
+          array_push($period_arr, $period['value']);
+        }
+        //drupal_set_message("<pre>".print_r($alloc_entity->field_pre_alloc_subject[LANGUAGE_NONE],1)."</pre>");
+        $subjectfc = $alloc_collection['value'];
+        $subject_name = $alloc_entity->field_pre_alloc_subject[LANGUAGE_NONE][0]['value'];
+        $subj_teacherid = $alloc_entity->field_pre_alloc_teacher[LANGUAGE_NONE][0]['target_id'];
+        $section_id = $alloc_entity->field_pre_alloc_section[LANGUAGE_NONE][0]['target_id'];
+        $section = NULL;
+        if(is_numeric($subjectfc) && is_numeric($subj_teacherid) && is_numeric($section_id) && !empty($period_arr)){
+          $section =  $school->get_section($section_id);
+          $teacherObj = $school->get_teacher($subj_teacherid);
+          if(empty($teacherObj)){
+            $teacher_node =node_load($subj_teacherid);
+            $subject_teacher = $teacher_node->title;
+            $teacherObj = new Teacher($subj_teacherid,$subject_teacher);
+            $school->set_teachers($teacherObj);
+          }
+          if($section instanceof Section){
+             $subject =  new Subject($subjectfc,$subject_name,Constants::TYPE_MAINSUBJECT,$teacherObj,Constants::NUM_ONE);
+            $subject->set_hard_allocation(TRUE);
+            $section->set_subjects($subject);
+            //drupal_set_message("Pre allocating class for: $section and $subject");
+            $section->get_timetableobj()->update_preallocated_slots($school,$section,$subject,$week_arr,$period_arr);
+          }
+        }
+      }
+    }
+  }
+}
+
+
+function timetable_prefallocate(&$school){
+  $preferences =  $school->get_preferences();
+  if($preferences->is_class_teacher_class_first()) {
+    foreach ($school->get_sections() as $key => $section) {
+      $class_teacher = $section->get_class_teacher();
+      $main_subjects = $section->get_subjects(Constants::TYPE_MAINSUBJECT);
+      foreach ($main_subjects as $key => $subject) {
+        $teacher = $subject->get_subject_teacher();
+        if($teacher->get_teacher_id() == $class_teacher->get_teacher_id()){
+          //$subject->set_hard_allocation(TRUE);
+          $section->get_timetableobj()->update_slot($school,$section,array($subject));
+        }
+      }
+    }
+  }
+
+  $labs_start = is_numeric($preferences->get_labs_start())?$preferences->get_labs_start():Constants::ONE;
+  foreach ($school->get_sections() as $key => $section) {
+    $lab_subjects =$section->get_subjects(Constants::TYPE_LABSUBJECT);
+    foreach ($lab_subjects as $key => $subject) {
+      $max_consec = $subject->get_num_consec_class();
+      if(is_numeric($max_consec) && $max_consec > 1){ //Difficult to optimize otherwise
+        $subject->set_hard_allocation(true);
+      }
+    }
+    $section->get_timetableobj()->update_slot($school,$section,$lab_subjects,$labs_start);
+  }
+}
+
+function timetable_updateclass(&$school,$tchr_maxconsec=NULL){
+  foreach ($school->get_sections() as $key => $section) {
+    foreach ($section->get_allsubjects() as $key => $subject) {
+      if($subject->is_full() === FALSE){
+        $allotment_left = $subject->get_allotment_left();
+        for($i=0;$i<$allotment_left;$i++){
+          $section->get_timetableobj()->update_empty_slot($school,$section,$subject,$tchr_maxconsec);
+        }
+      }
+    }
+  }
+}
+
+function timetable_printpendingsubjects(&$school){
+  foreach ($school->get_sections() as $key => $section) {
+    foreach ($section->get_allsubjects() as $key => $subject) {
+      //drupal_set_message("$section .. $subject has ".$subject->get_current_count()." of total: ".$subject->get_total_count());
+      if($subject->is_full() === FALSE){
+        $teacher = $subject->get_subject_teacher();
+        $teacher_empty_slots  = $teacher->print_empty_slots($school->get_slotmax()
+          ,$school->get_preferences()->get_sat_totclass()
+          ,$school->get_preferences()->get_max_consec_class()
+          , $school->get_preferences()->get_b4break_periods());
+        drupal_set_message("The total number of: ".$subject->get_allotment_left()." classes of total of: ".$subject->get_total_count()
+          ." for  $subject has not been allocated in $section. The empty slots for sub teacher: $teacher is $teacher_empty_slots",'warning');
+      }
+    }
+  }
+}
+
+function timetable_tchr_allocation(&$school){
+  $maxslots = $school->get_slotmax();
+  $minslots = $school->get_preferences()->get_sat_totclass();
+  $tchr_max_consec =$school->get_preferences()->get_max_consec_class();
+  $b4break_periods = $school->get_preferences()->get_b4break_periods();
+
+  foreach ($school->get_sections() as $key => $section) {
+    $section_timetable = $section->get_timetableobj();
+    $allsubjects = $section->get_allsubjects();
+    foreach ($allsubjects as $key => $pending_subject) {
+      $empty_slot_data = $section_timetable->get_empty_slot('ALL');
+      if(!empty($pending_subject) && !$pending_subject->is_full() && !empty($empty_slot_data)){
+        $pending_subj_teacher = $pending_subject->get_subject_teacher();
+        if(!empty($pending_subj_teacher)){
+          $empty_slots = $pending_subj_teacher->get_empty_slots($maxslots, $minslots,$tchr_max_consec,$b4break_periods);
+          //drupal_set_message("<pre>Empty Slot for $pending_subj_teacher for $pending_subject at $section: ".print_r($empty_slots,1)."</pre>");
+          foreach ($empty_slots as $slot) {
+            $empty_slot_subj = $section->get_timetableobj()->get_slot_data($slot['DAY'],$slot['INDEX']);
+            if(!empty($empty_slot_subj)) {
+              $empty_slot_subj_teacher = $empty_slot_subj->get_subject_teacher();
+              $teacher_section = $empty_slot_subj_teacher->get_slot_data($slot['DAY'],$slot['INDEX']);
+              //Subject exists in the current section as well
+              //drupal_set_message("$pending_subject for $section it comes here");
+              foreach ($empty_slot_data as $empty_slot) {
+                if($section_timetable->replace_subject_position($school,$section
+                  ,$empty_slot_subj,$empty_slot['DAY'],$empty_slot['INDEX']
+                  ,$pending_subject,$slot['DAY'],$slot['INDEX'])){
+                  break;
+                }
+              }
+            }else{
+              $section_timetable->update_slot_data($slot['DAY'],$slot['INDEX'],$pending_subject);
+              $pending_subject->increment_count();
+              $pending_subj_teacher->update_slot($slot['DAY'],$slot['INDEX'],$section);
+              //$school->update_teacher($pending_subjteacher);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
+function timetable_replace_subject(&$school){
+  $maxslots = $school->get_slotmax();
+  $minslots = $school->get_preferences()->get_sat_totclass();
+  $tchr_max_consec =$school->get_preferences()->get_max_consec_class();
+  $b4break_periods = $school->get_preferences()->get_b4break_periods();
+  foreach ($school->get_sections() as $key => $section) {
+    $section_timetable = $section->get_timetableobj();
+    $allsubjects = $section->get_allsubjects();
+    foreach ($allsubjects as $key => $pending_subject) {
+      $empty_slot_data = $section_timetable->get_empty_slot('ALL');
+      if(!empty($pending_subject) && !$pending_subject->is_full() && !empty($empty_slot_data)){
+        $pending_subj_teacher = $pending_subject->get_subject_teacher();
+        if(!empty($pending_subj_teacher)){
+          $tchr_empty_slots = $pending_subj_teacher->get_empty_slots($maxslots, $minslots,$tchr_max_consec,$b4break_periods);
+          foreach ($empty_slot_data as $empty_slot) {
+            $weekday = $empty_slot['DAY'];
+            $index = $empty_slot['INDEX'];
+            $teacher_section = $pending_subj_teacher->get_slot_data($weekday,$index);
+            if(!empty($teacher_section) && $teacher_section instanceof Section){
+              //drupal_set_message("$pending_subj_teacher section is: $teacher_section");
+              $teacher_section->get_timetableobj()->gen_replace_subject_position($school,$teacher_section, $pending_subject,$weekday,$index);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/*
+function timetable_tchr_emptyallocation(&$school){
+  $maxslots = $school->get_slotmax();
+  $minslots = $school->get_preferences()->get_sat_totclass();
+  $tchr_max_consec =$school->get_preferences()->get_max_consec_class();
+  $b4break_periods = $school->get_preferences()->get_b4break_periods();
+
+  foreach ($school->get_sections() as $key => $section) {
+    $section_timetable = $section->get_timetableobj();
+    $allsubjects = $section->get_allsubjects();
+
+    foreach ($allsubjects as $key => $pending_subject) {
+      $empty_slot_data = $section_timetable->get_empty_slot('ALL');
+      if(!empty($pending_subject) && !$pending_subject->is_full() && !empty($empty_slot_data)){
+        $pending_subj_teacher = $pending_subject->get_subject_teacher();
+        if(!empty($pending_subj_teacher)){
+          $empty_slots = $pending_subj_teacher->get_empty_slots($maxslots, $minslots,$tchr_max_consec,$b4break_periods);
+          //drupal_set_message("<pre>Empty Slot for $pending_subj_teacher for $pending_subject at $section: ".print_r($empty_slots,1)."</pre>");
+          foreach ($empty_slots as $slot) {
+            $empty_slot_subj = $section->get_timetableobj()->get_slot_data($slot['DAY'],$slot['INDEX']);
+            if(!empty($empty_slot_subj)) {
+              $empty_slot_subj_teacher = $empty_slot_subj->get_subject_teacher();
+              $teacher_section = $empty_slot_subj_teacher->get_slot_data($slot['DAY'],$slot['INDEX']);
+              //Subject exists in the current section as well
+              //drupal_set_message("$pending_subject for $section it comes here");
+              foreach ($empty_slot_data as $empty_slot) {
+                if($section_timetable->replace_subject_position($school,$section,$empty_slot_subj,$empty_slot['DAY'],$empty_slot['INDEX']
+                  ,$pending_subject,$slot['DAY'],$slot['INDEX'])){
+                  break;
+                }
+              }
+            }else{
+              $section_timetable->update_slot_data($slot['DAY'],$slot['INDEX'],$pending_subject);
+              $pending_subject->increment_count();
+              $pending_subj_teacher->update_slot($slot['DAY'],$slot['INDEX'],$section);
+              //$school->update_teacher($pending_subjteacher);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+  */
+
+
+
+function timetable_menu() {
+  $items = array();
+  $items['timetable'] = array(
+    'title' => 'Generate Timetable',
+    'page callback' => 'timetable_table',
+    'access arguments' => array('View Academic Timetable'),
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function timetable_permission() {
+  $perms = array(
+    'View Academic Timetable' => array(
+      'title' => t('View Academic Timetable'),
+    ),
+  );
+  return $perms;
+}
+
+function timetable_table() {
+  return drupal_get_form('timetable_form');
+}
+
+function timetable_printtable($section,$maxslots, $sat_class){
+  $days_replacement = array(1=>'I',2=>'II',3=>'III',4=>'IV',5=>'V',6=>'VI',7=>'VII',8=>'VIII',9=>'IX',10=>'X');
+  $timetable_data = array();
+  $data = array();
+  $timetable  = $section->get_timetable();
+  foreach ($timetable as $day=>$subjects) {
+    if($day != Constants::DAY_SATURDAY || ($sat_class != NULL && $sat_class != 0)){
+      $data[]= $day;
+      foreach ($subjects as $subject) {
+        $data[]= $subject;
+      }
+      $timetable_data[] = $data;
+    }
+
+    $data=NULL;
+  }
+  $variables=array();
+  $days_arr = array('Day');
+  for($i=1;$i<=$maxslots;$i++) {
+    array_push($days_arr, $days_replacement[$i]);
+  }
+  $variables['header']= $days_arr;
+  $variables['rows']=$timetable_data;
+  $variables['attributes']=array();
+  $variables['caption']=""; //Any useful text
+  $variables['colgroups']=array();
+  $variables['sticky']=array();
+  $variables['empty']="No Data Available";
+
+  return theme_table($variables);
+}
+
+function timetable_print_teachertable($teacher, $maxslots, $sat_class){
+  $days_replacement = array(1=>'I',2=>'II',3=>'III',4=>'IV',5=>'V',6=>'VI',7=>'VII',8=>'VIII',9=>'IX',10=>'X');
+  $timetable_data = array();
+  $data = array();
+  $timetable  = $teacher->get_slot();
+  if($timetable!=NULL && is_array($timetable)){
+    foreach ($timetable as $day=>$subjects) {
+      if($day != Constants::DAY_SATURDAY || $sat_class != 0){
+        $data[]= $day;
+        foreach ($subjects as $subject) {
+          $data[]= $subject;
+        }
+        $timetable_data[] = $data;
+      }
+      $data=NULL;
+    }
+  }
+  $variables=array();
+  $days_arr = array('Day');
+  for($i=1;$i<=$maxslots;$i++) {
+    array_push($days_arr, $days_replacement[$i]);
+  }
+  $variables['header']= $days_arr;
+  $variables['rows']=$timetable_data;
+  $variables['attributes']=array();
+  $variables['caption']=""; //Any useful text
+  $variables['colgroups']=array();
+  $variables['sticky']=array();
+  $variables['empty']="No Data Available";
+
+  return theme_table($variables);
+}
+
+/**
+* Menu callback.
+*/
+function timetable_form($form, &$form_state) {
+  $form['reports'] = array(
+    '#title' => t('Please select the options for Timetable'),
+    '#prefix' => '<div class="reports-filter">',
+    '#type' => 'fieldset',
+    '#description' => t('Academic Timetable '),
+    '#suffix' => '</div>',
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE
+  );
+
+  $form['reports']['school'] = array(
+    '#title' => t('School'),
+    '#type' => 'select',
+    '#options' => timetable_getschools(),
+    //'#default_value'=> "",
+    '#description' => t('Please select the school.'),
+  );
+
+  $form['reports']['submit'] = array(
+  '#type' => 'submit',
+  '#value' => t('Generate Time Table')
+  );
+
+  $form['reports']['submit_two'] = array(
+  '#type' => 'submit',
+  '#value' => t('Generate Teacher Timetable'),
+  '#submit' => array('timetable_form_teachersubmit'),
+  );
+
+  $form['reports']['submit_three'] = array(
+  '#type' => 'submit',
+  '#value' => t('Save Timetable Data'),
+  '#submit' => array('timetable_form_savesubmit'),
+  );
+
+  if(!isset($_SESSION["academic_timetable"])){
+    $_SESSION['academic_timetable']="";
+  }
+
+  $form['reports']['academic_timetable'] = array(
+    '#type' => 'item',
+    '#markup' =>$_SESSION["academic_timetable"],
+  );
+
+  $_SESSION["academic_timetable"]=null;
+  return $form;
+}
+
+function timetable_form_submit($form, &$form_state) {
+  $_SESSION["academic_timetable"] = null;
+  $school_nid = $form_state['values']['school'];
+  // Store values
+  $form_state['storage']['school'] = $form_state['values']['school'];
+  // Rebuild the form
+  $form_state['rebuild'] = TRUE;
+  $_SESSION["academic_timetable"]= timetable_generate($school_nid);
+}
+
+function timetable_form_teachersubmit($form, &$form_state) {
+  $_SESSION["academic_timetable"] = null;
+  $school_nid = $form_state['values']['school'];
+  // Store values
+  $form_state['storage']['school'] = $form_state['values']['school'];
+  // Rebuild the form
+  $form_state['rebuild'] = TRUE;
+  $_SESSION["academic_timetable"]= timetable_teacher_generate($school_nid);
+}
+
+function timetable_form_savesubmit($form, &$form_state) {
+  $_SESSION["academic_timetable"] = null;
+  $school_nid = $form_state['values']['school'];
+  // Store values
+  $form_state['storage']['school'] = $form_state['values']['school'];
+  // Rebuild the form
+  $form_state['rebuild'] = TRUE;
+  $_SESSION["academic_timetable"]= timetable_save_data($school_nid);
+}
+
+
+
+function timetable_init_tasks($school_nid){
+  include_once "School.php";
+  include_once "Subject.php";
+  include_once "Teacher.php";
+  include_once "Section.php";
+  include_once "Constants.php";
+  include_once "Preferences.php";
+  $school_node= node_load($school_nid);
+  $school = new School($school_node->nid, $school_node->title);
+  $school->set_slotmax($school_node->field_school_tot_num_class[LANGUAGE_NONE][0]['value']);
+  $preferences = timetable_update_pref($school_node);
+  $school->set_preferences($preferences);
+  //Processing Starts
+  $school = timetable_initializedata($school);
+  timetable_set_unavailability($school);
+  return $school;
+
+}
+
+function timetable_save_data($school_nid){
+  $school = timetable_init_tasks($school_nid);
+  $table="";
+  if(timetable_validate_sectionclass($school) == FALSE){
+    timetable_preallocate_classes($school);
+    timetable_prefallocate($school);
+    timetable_allocate($school);
+    //timetable_tchr_allocation($school);
+    timetable_updateclass($school);
+    timetable_replace_subject($school);
+    $tchr_max_consec = Constants::NUM_SIX;
+    timetable_updateclass($school,$tchr_max_consec);
+    //timetable_printpendingsubjects($school);
+
+    $node_nid = timetable_getnid($school_nid);
+    $school_data = NULL;
+    if (is_numeric($node_nid)) {
+     $school_data = node_load($node_nid);
+     if(!empty($school_data->field_timetable_teacher[LANGUAGE_NONE])) {
+      $fids=array();
+      foreach ($school_data->field_timetable_teacher[LANGUAGE_NONE] as $key => $collection_item) {
+       $fids[] = $collection_item['value'];
+      }
+      entity_delete_multiple('field_collection_item', array($fids)); // Delete field collection item.
+     }
+
+     if(!empty($school_data->field_timetable_section[LANGUAGE_NONE])) {
+      $fids=array();
+      foreach ($school_data->field_timetable_section[LANGUAGE_NONE] as $key => $collection_item) {
+       $fids[] = $collection_item['value'];
+      }
+      entity_delete_multiple('field_collection_item', array($fids)); // Delete field collection item.
+     }
+    }else{
+     $school_data = new stdClass();
+     $school_data->type = 'school_data';
+     node_object_prepare($school_data); //Creates default settings for the node of a type
+     $school_data->language = LANGUAGE_NONE; //String constant value for  "und"
+    }
+    $school_data->title    = $school_node->title." Timetable";
+
+    $school_teachers = $school->get_teachers();
+    foreach ($school_teachers as $key => $teacher) {
+      $field_collection_item = entity_create('field_collection_item', array('field_name' => 'field_timetable_teacher'));
+      $field_collection_item->setHostEntity('node', $school_data); // Attach it to the node.
+      $field_collection_item->field_teacher[LANGUAGE_NONE][0]['target_id']=$teacher->get_teacher_id();
+      $availability = $teacher->get_availability($school->get_slotmax(),$school->get_preferences()->get_sat_totclass());
+      $teacher_data= "<h3>Occupancy: $availability %</h3>".timetable_print_teachertable($teacher,$school->get_slotmax(),
+        $school->get_preferences()->get_sat_totclass());
+      $field_collection_item->field_teacher_timetable[LANGUAGE_NONE][0]['value']=$teacher_data;
+      $field_collection_item->field_teacher_timetable[LANGUAGE_NONE][0]['format']  = 'full_html';
+      $field_collection_item->save();
+    }
+
+
+    $all_sections = $school->get_sections();
+    foreach ($all_sections as $key => $section) {
+      $field_collection_item = entity_create('field_collection_item', array('field_name' => 'field_timetable_section'));
+      $field_collection_item->setHostEntity('node', $school_data); // Attach it to the node.
+      $field_collection_item->field_section[LANGUAGE_NONE][0]['target_id']=$section->get_Id();
+      $section_data= timetable_printtable($section,$school->get_slotmax(),$school->get_preferences()->get_sat_totclass());
+      $field_collection_item->field_section_timetable[LANGUAGE_NONE][0]['value']=$section_data;
+      $field_collection_item->field_section_timetable[LANGUAGE_NONE][0]['format']  = 'full_html';
+      $field_collection_item->save();
+    }
+    $serialized_data = serialize($school);
+    $school_data->body[LANGUAGE_NONE][0]['value'] = $serialized_data;
+    node_save($school_data);
+
+    drupal_set_message(" Successfully Saved Data ");
+  }else{
+    drupal_set_message("Please update sections that have higher number of classes than possible before proceeding forward");
+  }
+  return $table;
+}
+
+
+
+function timetable_update_pref($school_node){
+  $preferences =  new Preferences();
+  $preferences->set_class_teacher_first_class($school_node->field_school_classtchr_sub_first[LANGUAGE_NONE][0]['value']);
+  $preferences->set_labs_start($school_node->field_school_lab_period_start[LANGUAGE_NONE][0]['value']);
+  $periods_arr=array();
+  foreach ($school_node->field_school_periods_b4_break[LANGUAGE_NONE] as $key => $period) {
+    array_push($periods_arr, $period['value']);
+  }
+  $preferences->set_b4break_periods($periods_arr);
+  $preferences->set_sat_totclass(0);
+  if(!empty($school_node->field_school_sat_total_class[LANGUAGE_NONE])){
+    $preferences->set_sat_totclass($school_node->field_school_sat_total_class[LANGUAGE_NONE][0]['value']);
+  }
+  $preferences->set_max_consec_class($school_node->field_school_max_consec_classes[LANGUAGE_NONE][0]['value']);
+  //drupal_set_message("Preferences is: ".$preferences->get_max_consec_class());
+  return $preferences;
+
+}
+
+function timetable_generate($school_nid){
+  $school = timetable_init_tasks($school_nid);
+  $table="";
+  if(timetable_validate_sectionclass($school) == FALSE){
+    timetable_preallocate_classes($school);
+    timetable_prefallocate($school);
+    timetable_allocate($school);
+    //timetable_tchr_allocation($school);
+    timetable_updateclass($school);
+    timetable_replace_subject($school);
+    $tchr_max_consec = Constants::NUM_SIX;
+    timetable_updateclass($school,$tchr_max_consec);
+    //timetable_printpendingsubjects($school);
+
+    foreach ($school->get_sections() as $key => $section) {
+      $table.= "<h1>Timetable for: ".$section->getName()
+        ."</h1>".timetable_printtable($section,$school->get_slotmax(),$school->get_preferences()->get_sat_totclass());
+    }
+  }else{
+    drupal_set_message("Please update sections that have higher number of classes than possible before proceeding forward");
+  }
+  return $table;
+}
+
+function timetable_teacher_generate($school_nid){
+  $school = timetable_init_tasks($school_nid);
+  $table="";
+  if(timetable_validate_sectionclass($school) == FALSE){
+    timetable_preallocate_classes($school);
+    timetable_prefallocate($school);
+    timetable_allocate($school);
+    //timetable_tchr_allocation($school);
+    timetable_updateclass($school);
+    timetable_replace_subject($school);
+    $tchr_max_consec = Constants::NUM_SIX;
+    timetable_updateclass($school,$tchr_max_consec);
+    //  timetable_printpendingsubjects($school);
+    $school_teachers = $school->get_teachers();
+  foreach ($school_teachers as $key => $teacher) {
+    $availability = $teacher->get_availability($school->get_slotmax(),$school->get_preferences()->get_sat_totclass());
+    $table.= "<h1>Timetable for: ".$teacher->getName().". Occupancy: $availability %</h1>"
+    .timetable_print_teachertable($teacher,$school->get_slotmax(),$school->get_preferences()->get_sat_totclass());
+  }
+}else{
+  drupal_set_message("Please update sections that have higher number of classes than possible before proceeding forward");
+}
+  return $table;
+}
+
+
+?>

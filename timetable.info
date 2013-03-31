@@ -1,0 +1,5 @@
+name = Jagriti Class Scheduler
+description = "Allows Class TimeTable Scheduling."
+package = Jagriti Innovations
+core = 7.x
+files[] = timetable.module
